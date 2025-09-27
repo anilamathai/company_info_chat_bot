@@ -1,206 +1,158 @@
-import os
-import numpy as np
-from google import genai
-from sentence_transformers import SentenceTransformer
 import streamlit as st
-import re
-from dotenv import load_dotenv
+import os
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# --- CONFIGURATION & API KEY SETUP --- #
+# --- 1. CONFIGURATION AND SECRETS HANDLING ---
 
-# Load .env file immediately. This makes the key available via os.getenv().
-load_dotenv() 
-
-# 1. Determine API Key (Local or Cloud)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Fallback to Streamlit Secrets (for Streamlit Cloud deployment)
-if not GEMINI_API_KEY and "GEMINI_API_KEY" in st.secrets:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-
-# Function to safely create the Gemini Client
-@st.cache_resource
-def create_gemini_client(api_key):
-    if not api_key:
-        # This will only be hit if the key is missing from BOTH sources
-        raise ValueError("FATAL ERROR: GEMINI_API_KEY not found in Environment Variable or Streamlit Secrets.")
-
-    return genai.Client(api_key=api_key) 
-
-# Initialize the client outside the function, with a try/except 
-client = None
-try:
-    client = create_gemini_client(GEMINI_API_KEY)
-except ValueError as e:
-    # Store the error message in session state, but allow the rest of the script to run
-    st.session_state["gemini_client_error"] = str(e)
-    client = None
-
-# -------------------------------------------------------------
-# 2. Embedding Model: Initialize the local Sentence Transformer model
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-@st.cache_resource
-def get_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-embedding_model = get_embedding_model()
-
-# 3. LLM Model Settings
-MODEL = "gemini-2.5-flash"
-TEMPERATURE = 0.7
-MAX_TOKENS = 1000
-
-SYSTEM_PROMPT = (
-    "You are a knowledgeable and professional assistant. "
-    "You provide accurate, helpful, and concise information based on the provided knowledge base. "
-    "Always base your answers on the provided knowledge base and maintain a polite, professional tone. "
-    "If information is not available in the knowledge base, politely say so."
+# Set Streamlit page config
+st.set_page_config(
+    page_title="Gemini RAG Chatbot 💬",
+    page_icon="🤖",
+    layout="wide"
 )
 
-# ------------------ KNOWLEDGE BASE SETUP ------------------ #
+st.title("Gemini Pro RAG Assistant 🤖")
+st.subheader("Chat with your PDFs using Google Gemini and Streamlit")
 
-# Use Streamlit caching to load and process knowledge only once
-@st.cache_data
-def process_knowledge(file_path="new_knowledge.txt", chunk_size=200):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            knowledge = f.read()
-    except FileNotFoundError:
-        st.error(f"Knowledge file '{file_path}' not found. Please make sure the file exists.")
-        return [], None
-    
-    # Clean the text
-    knowledge = re.sub(r'\s+', ' ', knowledge)  # Remove extra whitespace
-    knowledge = knowledge.strip()
-    
-    # Split knowledge
-    words = knowledge.split()
-    chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-    
-    # Filter out very short chunks
-    chunks = [chunk for chunk in chunks if len(chunk.split()) > 10]
-    
-    if not chunks:
-        st.error("No valid chunks created from the knowledge file.")
-        return [], None
-    
-    # Generate and cache embeddings
-    chunk_embeddings = embedding_model.encode(chunks, convert_to_numpy=True)
-    
-    return chunks, chunk_embeddings
+# Securely load the API key from Streamlit secrets (for deployment)
+# or from environment variables (for local testing/manual setup)
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    # Fallback to os.getenv (for local testing with .env or manual setup)
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-KNOWLEDGE_CHUNKS, CHUNK_EMBEDDINGS = process_knowledge()
-
-# ------------------ CHAT FUNCTIONS ------------------ #
-
-def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0
-    return np.dot(a, b) / (norm_a * norm_b)
-
-def chat_with_rag(user_input):
-    # CRITICAL CHECK: Ensure client is initialized before using it
-    if client is None:
-        return st.session_state.get("gemini_client_error", "[Error: Gemini Client not initialized.]")
-
-    # Check if knowledge base is loaded
-    if not KNOWLEDGE_CHUNKS or CHUNK_EMBEDDINGS is None:
-        return "Knowledge base is not properly loaded. Please check your knowledge file."
-
-    messages = st.session_state.messages
-    
-    # RAG Logic
-    question_embedding = embedding_model.encode(user_input, convert_to_numpy=True)
-    similarities = [cosine_similarity(question_embedding, chunk_emb) for chunk_emb in CHUNK_EMBEDDINGS]
-    top_indices = np.argsort(similarities)[-3:]
-    relevant_chunks = "\n\n".join([KNOWLEDGE_CHUNKS[i] for i in reversed(top_indices)])
-
-    # UPDATED FORMAT 
-    contextual_user_prompt = f"Knowledge Base (Relevant Context):\n{relevant_chunks}\n\nUser Question: {user_input}"
-    
-    # Prepare contents for the Gemini API call
-    gemini_contents = []
-    # Add history from session state (skipping the system prompt at index 0)
-    for msg in messages[1:]:
-        role = 'model' if msg['role'] == 'assistant' else 'user'
-        gemini_contents.append({'role': role, 'parts': [{'text': msg['content']}]})
-
-    # Add the current RAG-augmented user prompt
-    gemini_contents.append({'role': 'user', 'parts': [{'text': contextual_user_prompt}]})
-    
-    # LLM Call
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=gemini_contents,
-            config={
-                "system_instruction": SYSTEM_PROMPT, 
-                "temperature": TEMPERATURE,
-                "max_output_tokens": MAX_TOKENS,
-            }
-        )
-    except Exception as e:
-        return f"[Error: Gemini API Call Failed] Details: {e}"
-
-    # Get assistant reply, add to history
-    reply = response.text
-    
-    # Add original user input and the reply to the session history for display
-    messages.append({"role": "user", "content": user_input})
-    messages.append({"role": "assistant", "content": reply})
-
-    return reply
-
-# ------------------ STREAMLIT UI IMPLEMENTATION ------------------ #
-
-st.set_page_config(page_title="Custom RAG Chatbot", layout="wide")
-st.title("🤖 Custom Knowledge Chatbot")
-# REMOVED: st.caption(f"Powered by **{MODEL}** (via Gemini API) and **Sentence-Transformers** (Local Embeddings)")
-
-# DISPLAY API KEY ERROR FIRST 
-if client is None:
-    st.error(st.session_state.get("gemini_client_error", "An unknown error occurred during client initialization."))
+if not GEMINI_API_KEY:
+    st.error("FATAL ERROR: GEMINI_API_KEY not found in Streamlit Secrets or Environment Variable. Please configure the key in the Streamlit App Settings.")
     st.stop()
-
-# Initialize chat history in Streamlit session state
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-# Display conversation history
-for message in st.session_state.messages:
-    if message["role"] != "system":
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-# Handle user input
-if prompt := st.chat_input("Ask questions about the knowledge base..."):
     
-    # 1. DISPLAY CURRENT USER PROMPT IMMEDIATELY
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# --- 2. CORE RAG FUNCTIONS (CACHED) ---
+
+# Use st.cache_resource to cache resource-heavy operations
+@st.cache_resource
+def get_vector_store(pdf_docs):
+    """Processes PDF documents, creates embeddings, and builds a FAISS vector store."""
+    st.info("Processing document and generating knowledge base...")
     
-    # 2. Generate and display assistant response
-    with st.chat_message("assistant"):
-        with st.spinner(f"Asking {MODEL}..."):
-            response = chat_with_rag(prompt)
-            st.markdown(response)
+    # Load documents from the uploaded files
+    all_text = ""
+    for pdf_file in pdf_docs:
+        # Save uploaded file to a temporary location to be read by PyPDFLoader
+        with open(f"./temp_{pdf_file.name}", "wb") as f:
+            f.write(pdf_file.getbuffer())
+        loader = PyPDFLoader(f"./temp_{pdf_file.name}")
+        pages = loader.load()
+        all_text += "\n".join(p.page_content for p in pages)
+        os.remove(f"./temp_{pdf_file.name}") # Clean up temp file
 
-# Display system metrics in the sidebar
-st.sidebar.header("System Metrics")
-st.sidebar.metric("Max Response Length", f"{MAX_TOKENS} tokens") 
-st.sidebar.markdown("---")
+    # Split text into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    chunks = text_splitter.split_text(all_text)
+    
+    # Create embeddings and vector store
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", api_key=GEMINI_API_KEY)
+    vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+    st.success("Knowledge Base Created! You can now chat.")
+    return vector_store
 
-# REMOVED: "Setup Status" and "Sample Knowledge Chunks" section
-# REMOVED: if CHUNK_EMBEDDINGS is not None and len(KNOWLEDGE_CHUNKS) > 0: ...
+@st.cache_resource
+def get_conversation_chain(vector_store):
+    """Creates the LangChain Conversational Retrieval Chain."""
+    # Use Gemini Pro for the main model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash", 
+        temperature=0.3,
+        api_key=GEMINI_API_KEY
+    )
+    
+    # Create the RAG chain
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vector_store.as_retriever(),
+        return_source_documents=True
+    )
+    return conversation_chain
 
-# Add information about the current knowledge base
-st.sidebar.markdown("---")
-st.sidebar.markdown("**💡 Current Knowledge:**")
-st.sidebar.info("This chatbot is trained on your custom dataset. Ask specific questions about the content.")
+# --- 3. SESSION STATE MANAGEMENT AND UI ---
 
-if st.sidebar.button("🔄 Clear Chat History"):
-    st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    st.rerun()
+def initialize_session_state():
+    """Initializes message history and chain/vector store objects."""
+    if "conversation_chain" not in st.session_state:
+        st.session_state.conversation_chain = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = None
+
+def handle_user_input(user_question):
+    """Processes user input, runs the RAG chain, and updates the chat history."""
+    if st.session_state.conversation_chain is None:
+        st.warning("Please upload and process documents first.")
+        return
+
+    # Call the RAG chain
+    with st.spinner("Generating response..."):
+        try:
+            response = st.session_state.conversation_chain.invoke(
+                {"question": user_question, "chat_history": st.session_state.chat_history}
+            )
+        except Exception as e:
+            st.error(f"An API error occurred: {e}")
+            return
+            
+    # Update chat history
+    st.session_state.chat_history.append((user_question, response["answer"]))
+    
+    # Display the result (The display loop is separate, below)
+
+def display_chat_history():
+    """Displays all messages in the chat history."""
+    # Display newest messages first (reverse order)
+    for question, answer in reversed(st.session_state.chat_history):
+        # Assistant Message
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        
+        # User Message
+        with st.chat_message("user"):
+            st.markdown(question)
+
+# --- 4. STREAMLIT LAYOUT ---
+
+initialize_session_state()
+
+# Sidebar for file upload
+with st.sidebar:
+    st.header("Your Documents")
+    
+    # File uploader allows multiple PDFs
+    pdf_docs = st.file_uploader(
+        "Upload your PDFs here and click 'Process'",
+        accept_multiple_files=True,
+        type=['pdf']
+    )
+    
+    if st.button("Process Documents"):
+        if pdf_docs:
+            st.session_state.vector_store = get_vector_store(pdf_docs)
+            st.session_state.conversation_chain = get_conversation_chain(st.session_state.vector_store)
+            st.session_state.chat_history = [] # Clear history on new document upload
+        else:
+            st.warning("Please upload at least one PDF file.")
+
+# Main Chat Interface
+if st.session_state.vector_store:
+    user_question = st.chat_input("Ask a question about your documents...")
+    
+    if user_question:
+        handle_user_input(user_question)
+
+display_chat_history()
