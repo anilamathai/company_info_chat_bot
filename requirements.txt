@@ -1,5 +1,5 @@
 streamlit
-langchain
-langchain-google-genai 
-pandas
+google-genai
+python-dotenv
 numpy
+sentence-transformers
